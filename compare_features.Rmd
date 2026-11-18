@@ -1,0 +1,287 @@
+---
+title: "Evaluation and Interpretation: Cross-Method Feature Comparison"
+subtitle: "Breast Cancer Wisconsin (Diagnostic)"
+author: "Siham"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+params:
+  top_k: 10
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+<!--
+HOW TEAMMATES SUBMIT RESULTS
+  One CSV per method in results/top_features/, named after the method,
+  e.g. results/top_features/lasso_logistic.csv, with columns:
+      feature,rank,importance
+      concave_points_worst,1,0.42
+  - feature: exact names from FEATURES in data_prep.R
+  - rank: 1 = most important; at least top_k features (all 30 is fine)
+  - importance (optional): carried into the table, not used for ranking
+  Files starting with "_" (like _template.csv) are ignored.
+
+KNIT eda.Rmd FIRST (it creates correlated_groups.csv and summary_by_diagnosis.csv).
+Change top_k with the `params` above, or:
+  rmarkdown::render("compare_features.Rmd", params = list(top_k = 5))
+-->
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 150)
+source("data_prep.R")
+library(ggplot2)
+library(knitr)
+options(knitr.kable.NA = "")
+
+TOP_K   <- as.integer(params$top_k)
+IN_DIR  <- file.path("results", "top_features")
+TAB_DIR <- file.path("outputs", "tables")
+FIG_DIR <- file.path("outputs", "figures")
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+groups_path <- file.path(TAB_DIR, "correlated_groups.csv")
+eda_path    <- file.path(TAB_DIR, "summary_by_diagnosis.csv")
+if (!file.exists(groups_path) || !file.exists(eda_path)) {
+  stop("Knit eda.Rmd first (needs correlated_groups.csv and summary_by_diagnosis.csv).")
+}
+groups <- read.csv(groups_path, stringsAsFactors = FALSE)
+eda    <- read.csv(eda_path, stringsAsFactors = FALSE)
+eda$eda_rank <- rank(-abs(eda$cohens_d), ties.method = "min")
+
+group_of   <- setNames(groups$group, groups$feature)
+members_of <- setNames(groups$group_members, groups$group)
+```
+
+```{r load-submissions}
+files <- list.files(IN_DIR, pattern = "\\.csv$", full.names = TRUE)
+files <- files[!startsWith(basename(files), "_")]
+
+subs <- list()
+for (f in files) {
+  d <- read.csv(f, stringsAsFactors = FALSE)
+  names(d) <- tolower(trimws(names(d)))
+  if (!all(c("feature", "rank") %in% names(d))) {
+    stop(basename(f), ": needs columns 'feature' and 'rank'")
+  }
+  d$feature <- trimws(d$feature)
+  bad <- setdiff(d$feature, FEATURES)
+  if (length(bad) > 0) {
+    stop(basename(f), ": unknown feature name(s): ", paste(bad, collapse = ", "),
+         ". Use the names in FEATURES from data_prep.R.")
+  }
+  if (anyDuplicated(d$feature)) stop(basename(f), ": a feature is listed twice")
+  subs[[tools::file_path_sans_ext(basename(f))]] <- head(d[order(d$rank), ], TOP_K)
+}
+short <- names(subs)[vapply(subs, nrow, integer(1)) < TOP_K]
+```
+
+```{r too-few, results = "asis"}
+if (length(subs) < 2) {
+  cat(sprintf("**Waiting for results:** found %d method file(s) in `%s`; need at least 2.\n",
+              length(subs), IN_DIR))
+  knitr::knit_exit()
+}
+```
+
+# Methods compared
+
+```{r methods-table}
+methods <- names(subs)
+n_m <- length(methods)
+kable(data.frame(Method = methods,
+                 `Features submitted` = vapply(subs, nrow, integer(1)),
+                 check.names = FALSE, row.names = NULL),
+      caption = sprintf("Each method's top %d features are compared", TOP_K))
+```
+
+```{r short-note, results = "asis"}
+if (length(short)) {
+  cat(sprintf("*Note: %s submitted fewer than %d features.*\n",
+              paste(short, collapse = ", "), TOP_K))
+}
+```
+
+# Feature-level comparison
+
+```{r feature-table}
+all_feats <- unique(unlist(lapply(subs, `[[`, "feature")))
+rank_mat <- matrix(
+  vapply(methods, function(m) as.numeric(subs[[m]]$rank[match(all_feats, subs[[m]]$feature)]),
+         numeric(length(all_feats))),
+  nrow = length(all_feats), dimnames = list(all_feats, methods)
+)
+
+tab <- data.frame(feature = all_feats, stringsAsFactors = FALSE)
+for (m in methods) tab[[paste0("rank_", m)]] <- rank_mat[, m]
+tab$n_methods <- rowSums(!is.na(rank_mat))
+tab$mean_rank_when_selected <- round(rowMeans(rank_mat, na.rm = TRUE), 2)
+tab$group        <- unname(group_of[all_feats])
+tab$eda_cohens_d <- round(eda$cohens_d[match(all_feats, eda$feature)], 3)
+tab$eda_rank     <- eda$eda_rank[match(all_feats, eda$feature)]
+for (m in methods) {
+  if ("importance" %in% names(subs[[m]])) {
+    tab[[paste0("importance_", m)]] <- subs[[m]]$importance[match(all_feats, subs[[m]]$feature)]
+  }
+}
+tab <- tab[order(-tab$n_methods, tab$mean_rank_when_selected), ]
+write.csv(tab, file.path(TAB_DIR, "feature_comparison.csv"), row.names = FALSE, na = "")
+
+show_cols <- c("feature", paste0("rank_", methods), "n_methods", "group", "eda_rank")
+kable(tab[, show_cols], row.names = FALSE, digits = 2,
+      col.names = c("Feature", methods, "# methods", "Group", "EDA rank"),
+      caption = paste("Rank of each feature within each method's top", TOP_K,
+                      "(blank = not selected). EDA rank = rank of |Cohen's d| (1 = largest class difference)."))
+```
+
+```{r heatmap, fig.width = 1.3 * n_m + 5, fig.height = 0.3 * nrow(tab) + 2}
+ylab_of <- setNames(
+  ifelse(startsWith(tab$group, "G"),
+         sprintf("%s [%s]  (%d/%d)", tab$feature, tab$group, tab$n_methods, n_m),
+         sprintf("%s  (%d/%d)", tab$feature, tab$n_methods, n_m)),
+  tab$feature)
+heat <- data.frame(
+  feature = rep(tab$feature, times = n_m),
+  method  = rep(methods, each = nrow(tab)),
+  rank    = as.vector(rank_mat[tab$feature, , drop = FALSE]),
+  stringsAsFactors = FALSE
+)
+heat$y <- factor(unname(ylab_of[heat$feature]), levels = rev(unname(ylab_of[tab$feature])))
+heat$x <- factor(heat$method, levels = methods)
+heat$label <- ifelse(is.na(heat$rank), "", heat$rank)
+heat$ink   <- ifelse(!is.na(heat$rank) & heat$rank <= 0.6 * TOP_K, "#ffffff", "#0b0b0b")
+
+p <- ggplot(heat, aes(x, y, fill = rank)) +
+  geom_tile(color = "#fcfcfb", linewidth = 0.8) +
+  geom_text(aes(label = label, color = ink), size = 3) +
+  scale_color_identity() +
+  scale_fill_gradient(low = "#0d366b", high = "#cde2fb", limits = c(1, TOP_K),
+                      oob = scales::squish, na.value = "#f0efec", guide = "none") +
+  labs(title = sprintf("Top-%d feature ranks by method", TOP_K),
+       subtitle = "1 = most important; grey = not selected; [G#] = correlated group; (n/N) = methods selecting it",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 10) +
+  theme(panel.grid = element_blank(),
+        axis.text.x = element_text(angle = 30, hjust = 1),
+        plot.background = element_rect(fill = "#fcfcfb", color = NA))
+ggsave(file.path(FIG_DIR, "feature_comparison.png"), p,
+       width = 1.3 * n_m + 5, height = 0.3 * nrow(tab) + 2, dpi = 150,
+       bg = "#fcfcfb", limitsize = FALSE)
+p
+```
+
+```{r feature-summary, results = "asis"}
+half   <- max(2, ceiling(n_m / 2))
+all_m  <- tab$feature[tab$n_methods == n_m]
+most_m <- tab[tab$n_methods >= half & tab$n_methods < n_m, ]
+only1  <- tab[tab$n_methods == 1, ]
+which_method <- function(f) methods[!is.na(rank_mat[f, ])]
+
+cat(sprintf("- **Selected by all %d methods (%d):** %s\n", n_m, length(all_m),
+            if (length(all_m)) paste0("`", all_m, "`", collapse = ", ") else "none"))
+if (n_m > 2) {
+  cat(sprintf("- **Selected by most methods (at least %d of %d, not all):** %s\n", half, n_m,
+              if (nrow(most_m)) paste(sprintf("`%s` (%d)", most_m$feature, most_m$n_methods),
+                                      collapse = ", ") else "none"))
+}
+if (nrow(only1)) {
+  cat(sprintf("- **Picked by only one method:** %s\n",
+              paste(sprintf("`%s` (%s)", only1$feature,
+                            vapply(only1$feature, which_method, character(1))),
+                    collapse = ", ")))
+}
+```
+
+# Agreement at the correlated-group level
+
+Features in the same group (|*r*| ≥ 0.9, from the EDA) carry nearly the same information, so methods that
+pick *different members of the same group* are agreeing on the underlying signal. Regularized models such as
+lasso often keep one member and drop the rest, while tree-based importance is often split across members.
+
+```{r group-table}
+sel_groups <- lapply(subs, function(d) unique(unname(group_of[d$feature])))
+sel_feats  <- lapply(subs, `[[`, "feature")
+all_groups <- sort(unique(unlist(sel_groups)))
+
+gtab <- data.frame(group = all_groups,
+                   group_members = unname(members_of[all_groups]),
+                   stringsAsFactors = FALSE)
+for (m in methods) {
+  gtab[[m]] <- vapply(all_groups, function(g) {
+    paste(sel_feats[[m]][group_of[sel_feats[[m]]] == g], collapse = ", ")
+  }, character(1))
+}
+gtab$n_methods <- vapply(all_groups, function(g) {
+  sum(vapply(sel_groups, function(s) g %in% s, logical(1)))
+}, integer(1))
+gtab <- gtab[order(-gtab$n_methods, gtab$group), ]
+write.csv(gtab, file.path(TAB_DIR, "group_comparison.csv"), row.names = FALSE)
+
+multi_g <- gtab[startsWith(gtab$group, "G"), ]
+kable(multi_g[, c("group", methods, "n_methods")], row.names = FALSE,
+      col.names = c("Group", methods, "# methods"),
+      caption = "Which member(s) of each correlated group each method selected")
+```
+
+```{r group-key}
+kable(unique(groups[groups$group_size > 1, c("group", "group_members")]), row.names = FALSE,
+      col.names = c("Group", "Members"), caption = "Correlated groups (from EDA)")
+```
+
+# Pairwise overlap
+
+Jaccard similarity = (number shared) / (number in either list). It is computed on the selected features and
+on the groups those features belong to (a feature with no strong correlate is its own group).
+
+```{r overlap}
+jaccard <- function(a, b) length(intersect(a, b)) / length(union(a, b))
+overlap <- do.call(rbind, lapply(combn(methods, 2, simplify = FALSE), function(p) {
+  a <- p[1]; b <- p[2]
+  data.frame(method_a = a, method_b = b,
+             shared_features  = length(intersect(sel_feats[[a]], sel_feats[[b]])),
+             jaccard_features = round(jaccard(sel_feats[[a]], sel_feats[[b]]), 3),
+             shared_groups    = length(intersect(sel_groups[[a]], sel_groups[[b]])),
+             jaccard_groups   = round(jaccard(sel_groups[[a]], sel_groups[[b]]), 3))
+}))
+write.csv(overlap, file.path(TAB_DIR, "pairwise_overlap.csv"), row.names = FALSE)
+kable(overlap, digits = 2, row.names = FALSE,
+      col.names = c("Method A", "Method B", "Shared features", "Jaccard (features)",
+                    "Shared groups", "Jaccard (groups)"))
+```
+
+```{r overlap-note, results = "asis"}
+gap <- overlap$jaccard_groups - overlap$jaccard_features
+cat(sprintf(paste("Averaged over method pairs, Jaccard overlap is %.2f at the feature level and %.2f",
+                  "at the group level. When the group-level value is clearly higher, methods disagree on",
+                  "*which* correlated measurement to use but agree on *what kind* of information matters.\n"),
+            mean(overlap$jaccard_features), mean(overlap$jaccard_groups)))
+```
+
+# Comparison with univariate separation (EDA)
+
+```{r eda-compare, results = "asis"}
+weak <- tab[tab$eda_rank > 15, ]
+cat("The EDA rank orders all 30 features by how strongly they separate malignant from benign on their own",
+    "(|Cohen's *d*|). Features that models rank highly despite a low EDA rank contribute mainly in combination",
+    "with other features.\n\n")
+if (nrow(weak)) {
+  cat(sprintf("- `%s`: EDA rank %d, selected by %d of %d methods\n",
+              weak$feature, weak$eda_rank, weak$n_methods, n_m), sep = "")
+} else {
+  cat("Every selected feature is also among the 15 strongest univariate separators.\n")
+}
+```
+
+# Interpretation
+
+<!-- Write the team's interpretation here once results are in. Prompts:
+  - Which features/groups are consistently important across methods? Do they match the EDA?
+  - Where do methods disagree, and is it explained by correlated groups (same group, different member)?
+  - Which method-specific features appear, and does the method's design explain them
+    (e.g. lasso picking one member of a group, trees favoring features with many split points)?
+  - Clinical sense: size and contour irregularity (concave points) are known markers of malignancy.
+-->
+
+*To be written once all methods are in.*

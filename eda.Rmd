@@ -1,0 +1,323 @@
+---
+title: "Data Preparation and Exploratory Data Analysis"
+subtitle: "Breast Cancer Wisconsin (Diagnostic)"
+author: "Siham"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 150)
+source("data_prep.R")          # shared loader, split, and scaling
+library(ggplot2)
+library(knitr)
+
+CORR_THRESHOLD <- 0.90         # |r| at or above this = "highly correlated"
+FIG_DIR <- file.path("outputs", "figures")
+TAB_DIR <- file.path("outputs", "tables")
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(TAB_DIR, showWarnings = FALSE, recursive = TRUE)
+
+# Colorblind-checked pair: benign = blue, malignant = orange
+DX_COLORS <- c(Benign = "#2a78d6", Malignant = "#eb6834")
+
+theme_eda <- theme_minimal(base_size = 9) +
+  theme(panel.grid.minor   = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(color = "#e4e3df", linewidth = 0.3),
+        strip.text         = element_text(size = 9, color = "#0b0b0b"),
+        axis.text          = element_text(color = "#52514e"),
+        plot.title         = element_text(size = 12, hjust = 0.5),
+        plot.background    = element_rect(fill = "#fcfcfb", color = NA),
+        legend.position    = "top")
+```
+
+# Data
+
+We use the Breast Cancer Wisconsin (Diagnostic) dataset (Wolberg, Mangasarian, Street, & Street, 1993)
+from the [UCI Machine Learning Repository](https://archive.ics.uci.edu/dataset/17). Each observation is a
+digitized image of a fine needle aspirate (FNA) of a breast mass. Ten properties of the cell nuclei are each
+summarized by their mean, standard error (`se`), and "worst" value (mean of the three largest), giving
+30 continuous features.
+
+```{r load}
+df <- load_data()
+df$dx <- factor(ifelse(df$diagnosis == 1, "Malignant", "Benign"),
+                levels = c("Benign", "Malignant"))
+
+# Long format: one row per (sample, feature), used for plotting
+long <- data.frame(
+  feature = factor(rep(FEATURES, each = nrow(df)), levels = FEATURES),
+  value   = unlist(df[FEATURES], use.names = FALSE),
+  dx      = rep(df$dx, times = length(FEATURES))
+)
+```
+
+The data contain `r nrow(df)` observations: `r sum(df$diagnosis == 1)` malignant
+(`r round(100 * mean(df$diagnosis), 1)`%) and `r sum(df$diagnosis == 0)` benign, with
+`r sum(is.na(df))` missing values.
+
+# Preprocessing
+
+All preprocessing lives in `data_prep.R`, which every team member sources so that we all work with
+identical data:
+
+1. **Recoding.** `diagnosis` is recoded so that malignant = 1 and benign = 0.
+2. **Stratified split.** 20% of each class is sampled separately for the test set using a fixed seed (`r RANDOM_SEED`),
+   so both sets keep the same malignant-to-benign ratio.
+3. **Standardization.** Features are centered and scaled using the **training set's** means and standard
+   deviations only. The test set is transformed with those same values, so no information from the test set
+   enters model training.
+
+```{r split}
+sp <- get_splits()
+
+split_summary <- data.frame(
+  Set         = c("Train", "Test"),
+  n           = c(length(sp$y_train), length(sp$y_test)),
+  Malignant   = c(sum(sp$y_train), sum(sp$y_test)),
+  Benign      = c(sum(sp$y_train == 0), sum(sp$y_test == 0)),
+  `% malignant` = round(100 * c(mean(sp$y_train), mean(sp$y_test)), 1),
+  check.names = FALSE
+)
+kable(split_summary, caption = "Stratified train/test split")
+```
+
+```{r scale-check}
+# Check: scaled training features have mean 0 and SD 1
+c(max_abs_mean = max(abs(colMeans(sp$X_train))),
+  min_sd = min(apply(sp$X_train, 2, sd)),
+  max_sd = max(apply(sp$X_train, 2, sd)))
+```
+
+```{r save-data, include = FALSE}
+save_csvs()   # data/cleaned_full.csv, data/train_scaled.csv, data/test_scaled.csv
+```
+
+# Summary statistics
+
+```{r summary-stats}
+skewness <- function(x) {     # adjusted Fisher-Pearson skewness
+  n <- length(x); z <- (x - mean(x)) / sd(x)
+  n / ((n - 1) * (n - 2)) * sum(z^3)
+}
+q <- function(p) sapply(df[FEATURES], quantile, probs = p, names = FALSE)
+
+summary_stats <- data.frame(
+  feature = FEATURES,
+  mean    = sapply(df[FEATURES], mean),
+  sd      = sapply(df[FEATURES], sd),
+  min     = sapply(df[FEATURES], min),
+  q1      = q(0.25),
+  median  = q(0.50),
+  q3      = q(0.75),
+  max     = sapply(df[FEATURES], max),
+  skew    = sapply(df[FEATURES], skewness),
+  row.names = NULL
+)
+write.csv(summary_stats, file.path(TAB_DIR, "summary_stats.csv"), row.names = FALSE)
+kable(summary_stats, digits = 4, caption = "Descriptive statistics, all 569 observations (original units)")
+```
+
+Features are on very different scales (e.g. `area_worst` is in the thousands while `fractal_dimension_se` is
+around 0.004), which is why standardization is needed before fitting scale-sensitive models. Many features,
+especially the `se` features, are right-skewed (skew > 1 for
+`r sum(summary_stats$skew > 1)` of 30 features).
+
+## By diagnosis
+
+Cohen's *d* is the difference between the malignant and benign means in pooled-SD units;
+`r_with_diagnosis` is the point-biserial correlation with the 0/1 label.
+
+```{r summary-by-dx}
+b <- df[df$diagnosis == 0, FEATURES]
+m <- df[df$diagnosis == 1, FEATURES]
+nb <- nrow(b); nm <- nrow(m)
+
+by_dx <- data.frame(
+  feature          = FEATURES,
+  benign_mean      = sapply(b, mean),
+  benign_sd        = sapply(b, sd),
+  benign_median    = sapply(b, median),
+  malignant_mean   = sapply(m, mean),
+  malignant_sd     = sapply(m, sd),
+  malignant_median = sapply(m, median),
+  row.names = NULL
+)
+pooled_sd <- sqrt(((nb - 1) * by_dx$benign_sd^2 + (nm - 1) * by_dx$malignant_sd^2) /
+                    (nb + nm - 2))
+by_dx$cohens_d         <- (by_dx$malignant_mean - by_dx$benign_mean) / pooled_sd
+by_dx$r_with_diagnosis <- sapply(df[FEATURES], cor, y = df$diagnosis)
+by_dx <- by_dx[order(-abs(by_dx$cohens_d)), ]
+write.csv(by_dx, file.path(TAB_DIR, "summary_by_diagnosis.csv"), row.names = FALSE)
+
+kable(by_dx[, c("feature", "benign_mean", "malignant_mean", "cohens_d", "r_with_diagnosis")],
+      digits = 3, row.names = FALSE,
+      caption = "Features ranked by how strongly they separate malignant from benign")
+```
+
+The strongest single separators are `r paste(head(by_dx$feature, 4), collapse = ", ")`
+(Cohen's *d* between `r round(min(head(by_dx$cohens_d, 4)), 2)` and `r round(max(head(by_dx$cohens_d, 4)), 2)`).
+Features with `d` near zero (`r paste(by_dx$feature[abs(by_dx$cohens_d) < 0.1], collapse = ", ")`)
+show almost no difference between classes on their own.
+
+# Distributions
+
+## Histograms
+
+```{r histograms, fig.width = 15, fig.height = 16}
+p_hist <- ggplot(long, aes(value, fill = dx)) +
+  geom_histogram(bins = 30, position = "identity", alpha = 0.55,
+                 color = "#fcfcfb", linewidth = 0.15) +
+  facet_wrap(~ feature, ncol = 5, scales = "free") +
+  scale_fill_manual(values = DX_COLORS, name = NULL) +
+  labs(title = "Feature distributions by diagnosis (counts, original units)",
+       x = NULL, y = "Count") +
+  theme_eda
+ggsave(file.path(FIG_DIR, "histograms.png"), p_hist,
+       width = 15, height = 16, dpi = 150, bg = "#fcfcfb")
+p_hist
+```
+
+## Boxplots by diagnosis
+
+```{r boxplots, fig.width = 15, fig.height = 6.5}
+stat_titles <- c(mean = "Mean", se = "Standard error", worst = "Worst")
+for (s in STATS) {
+  feats <- paste(PROPERTIES, s, sep = "_")
+  p_box <- ggplot(long[long$feature %in% feats, ], aes(dx, value, fill = dx)) +
+    geom_boxplot(width = 0.55, alpha = 0.8, color = "#52514e",
+                 outlier.shape = 1, outlier.size = 1, outlier.alpha = 0.6) +
+    facet_wrap(~ feature, nrow = 2, scales = "free_y") +
+    scale_fill_manual(values = DX_COLORS, guide = "none") +
+    labs(title = paste(stat_titles[[s]], "features by diagnosis (original units)"),
+         x = NULL, y = NULL) +
+    theme_eda
+  ggsave(file.path(FIG_DIR, paste0("boxplots_", s, ".png")), p_box,
+         width = 15, height = 6.5, dpi = 150, bg = "#fcfcfb")
+  print(p_box)
+}
+```
+
+Malignant masses tend to have larger, more irregular nuclei: size (radius, perimeter, area) and contour
+features (concavity, concave points, compactness) are clearly shifted upward for malignant cases. Smoothness
+and symmetry shift only moderately, with much more overlap between classes, and fractal dimension barely
+differs at all.
+
+# Correlations
+
+```{r heatmap, fig.width = 11, fig.height = 10}
+cm  <- cor(df[FEATURES])
+n_f <- length(FEATURES)
+cor_long <- data.frame(
+  row_feat = rep(FEATURES, times = n_f),
+  col_feat = rep(FEATURES, each = n_f),
+  r        = as.vector(cm),
+  stringsAsFactors = FALSE
+)
+cor_long$high <- abs(cor_long$r) >= CORR_THRESHOLD & cor_long$row_feat != cor_long$col_feat
+cor_long$x <- factor(cor_long$col_feat, levels = FEATURES)
+cor_long$y <- factor(cor_long$row_feat, levels = rev(FEATURES))
+
+p_heat <- ggplot(cor_long, aes(x, y, fill = r)) +
+  geom_tile() +
+  geom_point(data = cor_long[cor_long$high, ], size = 0.7, color = "#0b0b0b",
+             show.legend = FALSE) +
+  geom_vline(xintercept = c(10.5, 20.5), color = "#fcfcfb", linewidth = 1) +   # mean | se | worst
+  geom_hline(yintercept = c(10.5, 20.5), color = "#fcfcfb", linewidth = 1) +
+  scale_fill_gradientn(colours = c("#104281", "#3987e5", "#f0efec", "#e34948", "#8f1f1f"),
+                       limits = c(-1, 1), name = "Pearson r") +
+  coord_fixed() +
+  labs(title = sprintf("Feature correlation matrix (dots: |r| >= %.1f)", CORR_THRESHOLD),
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 9) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7.5),
+        axis.text.y = element_text(size = 7.5),
+        panel.grid  = element_blank(),
+        plot.title  = element_text(size = 12, hjust = 0.5),
+        plot.background = element_rect(fill = "#fcfcfb", color = NA))
+ggsave(file.path(FIG_DIR, "correlation_heatmap.png"), p_heat,
+       width = 11, height = 10, dpi = 150, bg = "#fcfcfb")
+p_heat
+```
+
+## Highly correlated feature groups
+
+Two features are linked if |*r*| ≥ `r CORR_THRESHOLD`. A group is every feature connected through such
+links (connected components), so a feature belongs to a group even if it is strongly correlated with only
+one member.
+
+```{r groups}
+hi <- which(upper.tri(cm) & abs(cm) >= CORR_THRESHOLD, arr.ind = TRUE)
+pairs <- data.frame(feature_1 = FEATURES[hi[, "row"]],
+                    feature_2 = FEATURES[hi[, "col"]],
+                    r         = round(cm[hi], 4))
+pairs <- pairs[order(-abs(pairs$r)), ]
+write.csv(pairs, file.path(TAB_DIR, "high_corr_pairs.csv"), row.names = FALSE)
+
+# Connected components (breadth-first search over the |r| >= threshold graph)
+adj <- abs(cm) >= CORR_THRESHOLD
+diag(adj) <- FALSE
+comp <- rep(NA_integer_, n_f)
+k <- 0L
+for (i in seq_len(n_f)) {
+  if (!is.na(comp[i])) next
+  k <- k + 1L
+  comp[i] <- k
+  queue <- i
+  while (length(queue) > 0) {
+    v <- queue[1]; queue <- queue[-1]
+    nb_idx <- which(adj[v, ] & is.na(comp))
+    comp[nb_idx] <- k
+    queue <- c(queue, nb_idx)
+  }
+}
+sizes <- tabulate(comp)
+multi <- which(sizes > 1)
+multi <- multi[order(-sizes[multi], multi)]          # biggest group first
+group_name <- setNames(paste0("G", seq_along(multi)), multi)
+
+groups <- data.frame(feature = FEATURES, stringsAsFactors = FALSE)
+groups$group <- unname(ifelse(sizes[comp] > 1, group_name[as.character(comp)], FEATURES))
+groups$group_size <- sizes[comp]
+groups$group_members <- sapply(comp, function(cid) paste(FEATURES[comp == cid], collapse = "; "))
+groups <- groups[order(groups$group_size == 1, groups$group), ]
+write.csv(groups, file.path(TAB_DIR, "correlated_groups.csv"), row.names = FALSE)
+
+group_table <- unique(groups[groups$group_size > 1, c("group", "group_size", "group_members")])
+kable(group_table, row.names = FALSE,
+      col.names = c("Group", "Size", "Features"),
+      caption = sprintf("Feature groups linked by |r| >= %.2f", CORR_THRESHOLD))
+```
+
+There are `r nrow(pairs)` feature pairs with |*r*| ≥ `r CORR_THRESHOLD`, which form
+`r nrow(group_table)` groups:
+
+- **Size:** radius, perimeter, and area (mean and worst) are nearly redundant. This is expected
+  geometrically, since perimeter and area are functions of radius.
+- **Contour indentation:** concavity and concave points.
+- **Size variability:** the standard errors of radius, perimeter, and area.
+- **Texture:** mean and worst texture.
+
+The remaining `r sum(groups$group_size == 1)` features have no partner above the threshold.
+
+**Implications for the modeling sections.** Within a group, features carry largely the same information.
+Unregularized models may give unstable or sign-flipped coefficients for group members; lasso tends to keep
+one member and drop the others; tree-based importance tends to be split across members. When comparing top
+features across methods, picking *different members of the same group* should therefore be read as agreement
+on the underlying signal.
+
+```{r top-pairs}
+kable(head(pairs, 10), row.names = FALSE, caption = "Ten most correlated pairs")
+```
+
+# References
+
+Wolberg, W., Mangasarian, O., Street, N., & Street, W. (1993). *Breast Cancer Wisconsin (Diagnostic)*
+[Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5DW2B

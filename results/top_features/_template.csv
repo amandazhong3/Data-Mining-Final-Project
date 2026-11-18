@@ -1,0 +1,4 @@
+feature,rank,importance
+concave_points_worst,1,0.42
+radius_worst,2,0.37
+texture_worst,3,0.21
